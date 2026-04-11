@@ -1,0 +1,219 @@
+import cv2
+import numpy as np
+import serial
+import time
+import subprocess
+from pyzbar.pyzbar import decode
+
+print("🚀 QR Tracking System Started")
+
+# ═══════════════════════════════════════════════════════════════
+#  TUNING
+# ═══════════════════════════════════════════════════════════════
+SERVO_DIR   = 1
+
+WIDTH, HEIGHT  = 640, 480
+CENTER_X       = WIDTH // 2
+
+Kp, Ki, Kd     = 0.06, 0.0, 0.018
+DEAD_ZONE      = 15
+LOCK_ZONE      = 25
+LOCK_CONFIRM   = 5
+REACQUIRE_ZONE = 40
+
+MAX_STEP       = 3.5     # 🔧 reduced for stability
+MIN_STEP       = 0.3
+SERVO_EMA      = 0.2     # 🔧 lower = less drift
+SERVO_HZ       = 30
+SERVO_INTERVAL = 1.0 / SERVO_HZ
+
+EMA_ALPHA      = 0.55
+MAX_LOST       = 20
+SEARCH_STEP    = 1.2
+CAPTURE_FPS    = 15
+
+# ═══════════════════════════════════════════════════════════════
+#  SERIAL
+# ═══════════════════════════════════════════════════════════════
+try:
+    ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+    time.sleep(2)
+    print("✅ Serial Connected")
+except Exception as e:
+    ser = None
+    print(f"❌ Serial NOT connected: {e}")
+
+_last_send  = 0.0
+_last_angle = -1
+
+def send_servo(angle: float):
+    global _last_send, _last_angle
+    now = time.monotonic()
+    a   = int(np.clip(angle, 0, 180))
+    if now - _last_send >= SERVO_INTERVAL and a != _last_angle:
+        if ser:
+            ser.write(f"{a}\n".encode())
+        _last_send  = now
+        _last_angle = a
+
+# ═══════════════════════════════════════════════════════════════
+#  CAMERA
+# ═══════════════════════════════════════════════════════════════
+pipe = subprocess.Popen(
+    ["rpicam-vid",
+     "--width", str(WIDTH),
+     "--height", str(HEIGHT),
+     "--framerate", str(CAPTURE_FPS),
+     "--codec", "yuv420",
+     "--timeout", "0",
+     "-o", "-"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    bufsize=10**8
+)
+
+def get_frame():
+    size = WIDTH * HEIGHT * 3 // 2
+    raw  = pipe.stdout.read(size)
+    if len(raw) != size:
+        return None
+    yuv = np.frombuffer(raw, dtype=np.uint8).reshape((HEIGHT * 3 // 2, WIDTH))
+    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+
+def detect_qr(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    results = decode(gray)
+    return results
+
+# ═══════════════════════════════════════════════════════════════
+#  KALMAN
+# ═══════════════════════════════════════════════════════════════
+kf = cv2.KalmanFilter(1, 1)
+kf.measurementMatrix   = np.array([[1.0]], np.float32)
+kf.transitionMatrix    = np.array([[1.0]], np.float32)
+kf.processNoiseCov     = np.array([[2.0]], np.float32)
+kf.measurementNoiseCov = np.array([[15.0]], np.float32)
+kf.errorCovPost        = np.array([[10.0]], np.float32)
+
+def kalman_init(cx):
+    kf.statePost = np.array([[cx]], np.float32)
+
+def kalman_smooth(cx):
+    kf.correct(np.array([[np.float32(cx)]]))
+    return float(kf.predict()[0, 0])
+
+# ═══════════════════════════════════════════════════════════════
+#  STATE
+# ═══════════════════════════════════════════════════════════════
+S = dict(
+    pan=90.0,
+    smooth_pan=90.0,
+    direction=1,
+    state="search",
+    consecutive_lost=0,
+    lock_count=0,
+    prev_error=0.0,
+    integral=0.0,
+    ema_cx=float(CENTER_X),
+    last_known_cx=float(CENTER_X),
+    just_acquired=0
+)
+
+def reset_pid():
+    S["prev_error"] = 0.0
+    S["integral"]   = 0.0
+
+def run_pid(cx):
+    error = CENTER_X - cx
+
+    if abs(error) >= DEAD_ZONE:
+        S["integral"] += error
+        derivative = error - S["prev_error"]
+
+        pid = Kp * error + Ki * S["integral"] + Kd * derivative
+        step = SERVO_DIR * np.clip(pid, -MAX_STEP, MAX_STEP)
+
+        if abs(step) >= MIN_STEP:
+            S["pan"] = np.clip(S["pan"] + step, 0, 180)
+
+    S["prev_error"] = error
+    return error
+
+def smooth_and_send():
+    if S["just_acquired"] > 0:
+        S["smooth_pan"] = S["pan"]
+        S["just_acquired"] -= 1
+    else:
+        S["smooth_pan"] = SERVO_EMA * S["pan"] + (1 - SERVO_EMA) * S["smooth_pan"]
+
+    send_servo(S["smooth_pan"])
+
+def hold_and_send():
+    send_servo(S["smooth_pan"])
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN LOOP
+# ═══════════════════════════════════════════════════════════════
+while True:
+    frame = get_frame()
+    if frame is None:
+        continue
+
+    qr_codes = detect_qr(frame)
+
+    # ── DETECTED ─────────────────────────────
+    if qr_codes:
+        S["consecutive_lost"] = 0
+
+        x, y, w, h = qr_codes[0].rect
+        cx = float(x + w // 2)
+
+        # 🚀 SEARCH → TRACKING (FIXED)
+        if S["state"] == "search":
+            S["pan"] = S["smooth_pan"]   # HARD STOP
+            S["direction"] = 0
+
+            kalman_init(cx)
+            reset_pid()
+
+            S["just_acquired"] = 4
+            S["state"] = "tracking"
+
+            print("🎯 ACQUIRED")
+
+        # TRACKING
+        S["ema_cx"] = EMA_ALPHA * cx + (1 - EMA_ALPHA) * S["ema_cx"]
+        est = kalman_smooth(S["ema_cx"])
+
+        error = run_pid(est)
+        smooth_and_send()
+
+        print(f"TRACK | Err:{error:.1f} | Servo:{int(S['smooth_pan'])}")
+
+    # ── NOT DETECTED ─────────────────────────
+    else:
+        if S["state"] == "search":
+            S["pan"] += S["direction"] * SEARCH_STEP
+
+            if S["pan"] >= 165 or S["pan"] <= 15:
+                S["direction"] *= -1
+
+            S["pan"] = np.clip(S["pan"], 0, 180)
+            smooth_and_send()
+
+            print(f"🔍 SEARCH | Servo:{int(S['smooth_pan'])}")
+            continue
+
+        S["consecutive_lost"] += 1
+
+        if S["consecutive_lost"] > MAX_LOST:
+            print("❌ LOST → SEARCH")
+            S["state"] = "search"
+            S["direction"] = 1
+            reset_pid()
+            continue
+
+        hold_and_send()
+        print("🧠 HOLD")
+
+    time.sleep(0.02)
