@@ -5,11 +5,8 @@ import time
 import subprocess
 from pyzbar.pyzbar import decode
 
-print("🚀 QR Tracking Robot Started")
+print("QR Tracking Robot Started")
 
-# ═══════════════════════════════════════════════════════════════
-#  TUNING
-# ═══════════════════════════════════════════════════════════════
 SERVO_DIR   = 1
 
 WIDTH, HEIGHT  = 640, 480
@@ -29,26 +26,19 @@ MAX_LOST       = 20
 SEARCH_STEP    = 1.2
 CAPTURE_FPS    = 15
 
-# ═══════════════════════════════════════════════════════════════
-#  SERIAL  (protocol: "pan,size\n")
-#    pan  — servo angle 0-180
-#    size — QR bounding box width in pixels (0 when not detected)
-#           Arduino uses this to decide phase and forward speed
-# ═══════════════════════════════════════════════════════════════
 try:
     ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
     time.sleep(2)
-    print("✅ Serial Connected")
+    print("Serial Connected")
 except Exception as e:
     ser = None
-    print(f"❌ Serial NOT connected: {e}")
+    print(f"Serial NOT connected: {e}")
 
 _last_send  = 0.0
 _last_pan   = -1
 _last_size  = -1
 
 def send_command(pan_angle: float, qr_size: int):
-    """Send pan,size over serial, rate-limited to SERVO_HZ."""
     global _last_send, _last_pan, _last_size
     now = time.monotonic()
     p   = int(np.clip(pan_angle, 0, 180))
@@ -60,9 +50,6 @@ def send_command(pan_angle: float, qr_size: int):
         _last_pan   = p
         _last_size  = s
 
-# ═══════════════════════════════════════════════════════════════
-#  CAMERA
-# ═══════════════════════════════════════════════════════════════
 pipe = subprocess.Popen(
     ["rpicam-vid",
      "--width", str(WIDTH),
@@ -88,9 +75,6 @@ def detect_qr(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return decode(gray)
 
-# ═══════════════════════════════════════════════════════════════
-#  KALMAN  (1-D, horizontal position only)
-# ═══════════════════════════════════════════════════════════════
 kf = cv2.KalmanFilter(1, 1)
 kf.measurementMatrix   = np.array([[1.0]], np.float32)
 kf.transitionMatrix    = np.array([[1.0]], np.float32)
@@ -105,9 +89,6 @@ def kalman_smooth(cx):
     kf.correct(np.array([[np.float32(cx)]]))
     return float(kf.predict()[0, 0])
 
-# ═══════════════════════════════════════════════════════════════
-#  STATE
-# ═══════════════════════════════════════════════════════════════
 S = dict(
     pan=90.0,
     smooth_pan=90.0,
@@ -136,9 +117,6 @@ def run_pid(cx):
     S["prev_error"] = error
     return error
 
-# ═══════════════════════════════════════════════════════════════
-#  MAIN LOOP
-# ═══════════════════════════════════════════════════════════════
 try:
     while True:
         frame = get_frame()
@@ -147,13 +125,12 @@ try:
 
         qr_codes = detect_qr(frame)
 
-        # ── DETECTED ─────────────────────────────────────────
         if qr_codes:
             S["consecutive_lost"] = 0
 
             x, y, w, h = qr_codes[0].rect
             cx      = float(x + w // 2)
-            qr_size = int(w)           # bounding box width → proxy for distance
+            qr_size = int(w)
 
             if S["state"] == "search":
                 S["pan"]       = S["smooth_pan"]
@@ -162,13 +139,12 @@ try:
                 reset_pid()
                 S["just_acquired"] = 4
                 S["state"] = "tracking"
-                print("🎯 ACQUIRED")
+                print("ACQUIRED")
 
             S["ema_cx"] = EMA_ALPHA * cx + (1 - EMA_ALPHA) * S["ema_cx"]
             est         = kalman_smooth(S["ema_cx"])
             error       = run_pid(est)
 
-            # Smooth servo angle
             if S["just_acquired"] > 0:
                 S["smooth_pan"] = S["pan"]
                 S["just_acquired"] -= 1
@@ -178,7 +154,6 @@ try:
             send_command(S["smooth_pan"], qr_size)
             print(f"TRACK | Err:{error:.1f} | Pan:{int(S['smooth_pan'])} | QRsize:{qr_size}")
 
-        # ── NOT DETECTED ─────────────────────────────────────
         else:
             if S["state"] == "search":
                 S["pan"] += S["direction"] * SEARCH_STEP
@@ -187,30 +162,30 @@ try:
                 S["pan"] = np.clip(S["pan"], 0, 180)
                 S["smooth_pan"] = SERVO_EMA * S["pan"] + (1 - SERVO_EMA) * S["smooth_pan"]
 
-                send_command(S["smooth_pan"], 0)   # size=0 → Arduino stops motors
-                print(f"🔍 SEARCH | Pan:{int(S['smooth_pan'])}")
+                send_command(S["smooth_pan"], 0)
+                print(f"SEARCH | Pan:{int(S['smooth_pan'])}")
                 continue
 
             S["consecutive_lost"] += 1
 
             if S["consecutive_lost"] > MAX_LOST:
-                print("❌ LOST → SEARCH")
+                print("LOST -> SEARCH")
                 S["state"]     = "search"
                 S["direction"] = 1
-                send_command(S["smooth_pan"], 0)   # stop motors
+                send_command(S["smooth_pan"], 0)
                 reset_pid()
                 continue
 
-            # Hold pan, send size=0 to keep motors stopped while holding
             send_command(S["smooth_pan"], 0)
-            print("🧠 HOLD")
+            print("HOLD")
 
         time.sleep(0.02)
 
 except KeyboardInterrupt:
-    print("⛔ Stopped by user")
+    print("Stopped by user")
     if ser:
         ser.write(b"90,0\n")
         time.sleep(0.1)
         ser.close()
     pipe.terminate()
+
